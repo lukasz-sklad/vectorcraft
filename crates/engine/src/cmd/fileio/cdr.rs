@@ -115,7 +115,9 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
                     x_shift,
                 };
                 insert_cdr_objects(&mut doc, &d, &ctx);
-            } else if let Some(r) = vectorcraft_cdr::preview(bytes).ok().and_then(|p| raster_image(&p.data).ok()) {
+            } else if let Some(r) =
+                vectorcraft_cdr::preview(bytes).ok().filter(|p| check_preview_limits(&p.data).is_ok()).and_then(|p| raster_image(&p.data).ok())
+            {
                 // Fallback to preview only if no vector objects exist
                 used_preview = true;
                 let id = doc.alloc_id();
@@ -137,6 +139,8 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
                 n.name = Some(format!("{name} (rendered)"));
                 doc.images.insert(r.key, r.blob);
                 let _ = doc.insert(default_layer, 0, n);
+            } else if d.warnings.iter().any(|w| w == "vector stream was uncompressed or could not be decompressed") {
+                return Err(err(format!("{name}: no importable vector data or usable preview")));
             }
 
             apply_crop_options(&mut doc, opts.crop);
@@ -388,14 +392,18 @@ fn apply_crop_options(doc: &mut Document, crop: CropTo) {
 fn preview(name: &str, bytes: &[u8], native: &vectorcraft_cdr::Error) -> Result<(Document, String)> {
     let p = vectorcraft_cdr::preview(bytes).map_err(|e| err(format!("{native}; its embedded preview can't be read either ({e})")))?;
 
-    let mut reader = image::ImageReader::new(Cursor::new(&p.data));
-    reader = reader.with_guessed_format().map_err(err)?;
+    check_preview_limits(&p.data).map_err(err)?;
+    let d = raster_doc(name, &p.data)?;
+    Ok((d, format!("CorelDRAW: {native}; opened its embedded preview ({}x{} pixels).", p.width, p.height)))
+}
+
+fn check_preview_limits(data: &[u8]) -> image::ImageResult<()> {
+    let mut reader = image::ImageReader::new(Cursor::new(data));
+    reader = reader.with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(4096);
     limits.max_image_height = Some(4096);
     limits.max_alloc = Some(128 << 20);
     reader.limits(limits);
-    let _pixels = reader.decode().map_err(err)?;
-    let d = raster_doc(name, &p.data)?;
-    Ok((d, format!("CorelDRAW: {native}; opened its embedded preview ({}x{} pixels).", p.width, p.height)))
+    reader.decode().map(|_| ())
 }

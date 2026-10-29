@@ -285,6 +285,7 @@ struct StreamParser<'a> {
     buf: &'a [u8],
     block_sizes: &'a [u32],
     bitmaps: &'a mut HashMap<u32, CdrBitmap>,
+    bitmap_total: usize,
     max_total: usize,
     fills: HashMap<u32, Option<CdrColor>>,
     outlines: HashMap<u32, Option<CdrStroke>>,
@@ -320,7 +321,16 @@ impl<'a> StreamParser<'a> {
                 && let Some(lt) = self.buf.get(ds..ds.saturating_add(4))
             {
                 match lt {
-                    b"bmpt" => parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps, self.max_total, 1),
+                    b"bmpt" => {
+                        let mut bmpt = BmptParser {
+                            buf: self.buf,
+                            block_sizes: self.block_sizes,
+                            bitmaps: self.bitmaps,
+                            total: &mut self.bitmap_total,
+                            max_total: self.max_total,
+                        };
+                        bmpt.parse_range(ds + 4, de, 1);
+                    }
                     b"doc " => self.walk_doc(ds + 4, de, 1),
                     b"page" => {
                         // In CorelDRAW, `page[0]` is the Master Page (Desktop/Guides/Grid), and
@@ -352,7 +362,14 @@ impl<'a> StreamParser<'a> {
             if &cid == b"LIST" {
                 if let Some(lt) = self.buf.get(ds..ds.saturating_add(4)) {
                     if lt == b"bmpt" {
-                        parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps, self.max_total, depth + 1);
+                        let mut bmpt = BmptParser {
+                            buf: self.buf,
+                            block_sizes: self.block_sizes,
+                            bitmaps: self.bitmaps,
+                            total: &mut self.bitmap_total,
+                            max_total: self.max_total,
+                        };
+                        bmpt.parse_range(ds + 4, de, depth + 1);
                     } else if matches!(lt, b"filt" | b"filc" | b"otlt" | b"stlt" | b"bmtb") {
                         self.walk_doc(ds + 4, de, depth + 1);
                     }
@@ -377,10 +394,7 @@ impl<'a> StreamParser<'a> {
                 && let Some(data) = self.buf.get(ds..de)
                 && let Some((id, bmp)) = parse_bmp_chunk(data)
             {
-                let current_total: usize = self.bitmaps.values().map(|b| b.bmp_bytes.len()).sum();
-                if current_total.saturating_add(bmp.bmp_bytes.len()) <= self.max_total {
-                    self.bitmaps.insert(id, bmp);
-                }
+                insert_bitmap(self.bitmaps, &mut self.bitmap_total, self.max_total, id, bmp);
             }
             pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
         }
@@ -698,10 +712,12 @@ impl<'a> StreamParser<'a> {
 }
 
 fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>, max_total: usize) -> ParsedStream {
+    let bitmap_total = bitmaps.values().map(|b| b.bmp_bytes.len()).sum();
     let mut parser = StreamParser {
         buf: stream,
         block_sizes,
         bitmaps,
+        bitmap_total,
         max_total,
         fills: HashMap::new(),
         outlines: HashMap::new(),
@@ -828,49 +844,59 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u3
     ParsedStream { width: page_w, height: page_h, artboards, layers: parser.layers, objects }
 }
 
-fn parse_bmpt_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>, max_total: usize) {
-    parse_bmpt_range(stream, block_sizes, 12, stream.len(), bitmaps, max_total, 0);
+fn insert_bitmap(bitmaps: &mut HashMap<u32, CdrBitmap>, total: &mut usize, max_total: usize, id: u32, bmp: CdrBitmap) {
+    let old = bitmaps.get(&id).map_or(0, |b| b.bmp_bytes.len());
+    let new_total = total.saturating_sub(old).saturating_add(bmp.bmp_bytes.len());
+    if new_total <= max_total {
+        *total = new_total;
+        bitmaps.insert(id, bmp);
+    }
 }
 
-fn parse_bmpt_range(
-    buf: &[u8],
-    block_sizes: &[u32],
-    start: usize,
-    end: usize,
-    bitmaps: &mut HashMap<u32, CdrBitmap>,
+struct BmptParser<'a> {
+    buf: &'a [u8],
+    block_sizes: &'a [u32],
+    bitmaps: &'a mut HashMap<u32, CdrBitmap>,
+    total: &'a mut usize,
     max_total: usize,
-    depth: usize,
-) {
-    if depth >= 64 {
-        return;
-    }
-    let mut pos = start;
-    while pos.saturating_add(8) <= end {
-        let Some(hdr) = buf.get(pos..pos + 8) else { break };
-        let cid: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
-        let raw_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
-        let bsize = if !block_sizes.is_empty()
-            && let Some(&bs) = block_sizes.get(raw_len)
-        {
-            bs as usize
-        } else {
-            raw_len
-        };
-        let ds = pos + 8;
-        let de = ds.saturating_add(bsize).min(end);
-        if &cid == b"bmp "
-            && let Some(bdata) = buf.get(ds..de)
-            && let Some((id, bmp)) = parse_bmp_chunk(bdata)
-        {
-            let current_total: usize = bitmaps.values().map(|b| b.bmp_bytes.len()).sum();
-            if current_total.saturating_add(bmp.bmp_bytes.len()) <= max_total {
-                bitmaps.insert(id, bmp);
-            }
-        } else if &cid == b"LIST" {
-            parse_bmpt_range(buf, block_sizes, ds + 4, de, bitmaps, max_total, depth + 1);
+}
+
+impl<'a> BmptParser<'a> {
+    fn parse_range(&mut self, start: usize, end: usize, depth: usize) {
+        if depth >= 64 {
+            return;
         }
-        pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
+        let mut pos = start;
+        while pos.saturating_add(8) <= end {
+            let Some(hdr) = self.buf.get(pos..pos + 8) else { break };
+            let cid: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
+            let raw_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+            let bsize = if !self.block_sizes.is_empty()
+                && let Some(&bs) = self.block_sizes.get(raw_len)
+            {
+                bs as usize
+            } else {
+                raw_len
+            };
+            let ds = pos + 8;
+            let de = ds.saturating_add(bsize).min(end);
+            if &cid == b"bmp "
+                && let Some(bdata) = self.buf.get(ds..de)
+                && let Some((id, bmp)) = parse_bmp_chunk(bdata)
+            {
+                insert_bitmap(self.bitmaps, self.total, self.max_total, id, bmp);
+            } else if &cid == b"LIST" {
+                self.parse_range(ds + 4, de, depth + 1);
+            }
+            pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
+        }
     }
+}
+
+fn parse_bmpt_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>, max_total: usize) {
+    let mut total = bitmaps.values().map(|b| b.bmp_bytes.len()).sum();
+    let mut parser = BmptParser { buf: stream, block_sizes, bitmaps, total: &mut total, max_total };
+    parser.parse_range(12, stream.len(), 0);
 }
 
 /// Parse a CorelDRAW `bmp ` chunk into `(bmp_id, CdrBitmap)` containing a valid standard BMP file.
