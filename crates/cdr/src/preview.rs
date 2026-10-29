@@ -135,9 +135,12 @@ fn preview_from_zip(bytes: &[u8]) -> Result<Preview, Error> {
             let png_data = match method {
                 0 => comp_data.to_vec(),
                 8 => {
-                    let mut decoder = DeflateDecoder::new(comp_data);
+                    let mut decoder = DeflateDecoder::new(comp_data).take((16 << 20) + 1);
                     let mut decompressed = Vec::new();
                     decoder.read_to_end(&mut decompressed).map_err(|_| Error::Malformed("decompression failed"))?;
+                    if decompressed.len() > 16 << 20 {
+                        return Err(Error::Limit("thumbnail exceeds size limit"));
+                    }
                     decompressed
                 }
                 _ => return Err(Error::Unsupported("unsupported ZIP compression method")),

@@ -40,6 +40,12 @@ fn test_cdr_load_real_file() {
         let loaded = load("ZAPROSZENIE_CMC.cdr", &bytes).expect("load ZAPROSZENIE_CMC.cdr");
         assert_eq!(loaded.doc.artboards.len(), 2, "ZAPROSZENIE_CMC.cdr should have 2 artboards");
         assert!(!loaded.doc.images.is_empty(), "ZAPROSZENIE_CMC.cdr should have embedded bitmaps");
+
+        // Test page subset filtering (e.g. page 2 only)
+        let p2_opts = LoadOptions { pages: Some("2".to_string()), ..Default::default() };
+        let p2_loaded = load_with("ZAPROSZENIE_CMC.cdr", &bytes, &p2_opts).expect("load page 2 of ZAPROSZENIE_CMC.cdr");
+        assert_eq!(p2_loaded.doc.artboards.len(), 1, "only 1 artboard when requesting page 2");
+        assert_eq!(p2_loaded.doc.artboards[0].rect.origin().x, 0.0, "artboard x starts at 0.0");
     }
 
     let spiewnik_path = std::path::Path::new("/home/deck/Pictures/cdr/spiewnik_2010.cdr");

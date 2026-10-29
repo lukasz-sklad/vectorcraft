@@ -194,6 +194,7 @@ fn read_riff(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
 
     let mut bitmaps: HashMap<u32, CdrBitmap> = HashMap::new();
     let mut doc_stream: Option<(Vec<u8>, Vec<u32>)> = None;
+    let mut total_decompressed = 0usize;
 
     // Decompress all `LIST [cmpr]` chunks: `cmpr[0]` may hold `LIST [bmpt]` (embedded bitmaps)
     // and `cmpr[1]` holds `LIST [doc ]` + `LIST [page]`.
@@ -210,8 +211,12 @@ fn read_riff(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
             };
 
             if let Some((dec, bs)) = decompressed {
+                total_decompressed = total_decompressed.saturating_add(dec.len());
+                if total_decompressed > limits.max_total {
+                    return Err(Error::Limit("cumulative decompressed size exceeds max_total limit"));
+                }
                 if dec.get(0..4) == Some(b"LIST") && dec.get(8..12) == Some(b"bmpt") {
-                    parse_bmpt_stream(&dec, &bs, &mut bitmaps);
+                    parse_bmpt_stream(&dec, &bs, &mut bitmaps, limits.max_total);
                 } else if doc_stream.is_none() {
                     doc_stream = Some((dec, bs));
                 }
@@ -227,7 +232,7 @@ fn read_riff(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
     let mut warnings = Vec::new();
 
     if let Some((dec, block_sizes)) = doc_stream {
-        let parsed = parse_cdr_stream(&dec, &block_sizes, &mut bitmaps);
+        let parsed = parse_cdr_stream(&dec, &block_sizes, &mut bitmaps, limits.max_total);
         if parsed.width >= 1.0 && parsed.height >= 1.0 {
             width = parsed.width;
             height = parsed.height;
@@ -280,6 +285,7 @@ struct StreamParser<'a> {
     buf: &'a [u8],
     block_sizes: &'a [u32],
     bitmaps: &'a mut HashMap<u32, CdrBitmap>,
+    max_total: usize,
     fills: HashMap<u32, Option<CdrColor>>,
     outlines: HashMap<u32, Option<CdrStroke>>,
     mcfg_size: Option<(f64, f64)>,
@@ -314,14 +320,14 @@ impl<'a> StreamParser<'a> {
                 && let Some(lt) = self.buf.get(ds..ds.saturating_add(4))
             {
                 match lt {
-                    b"bmpt" => parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps),
-                    b"doc " => self.walk_doc(ds + 4, de),
+                    b"bmpt" => parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps, self.max_total, 1),
+                    b"doc " => self.walk_doc(ds + 4, de, 1),
                     b"page" => {
                         // In CorelDRAW, `page[0]` is the Master Page (Desktop/Guides/Grid), and
                         // `page[1..=N]` are the N document pages (0..N-1).
                         self.current_doc_page = self.raw_page_count.saturating_sub(1);
                         self.raw_page_count += 1;
-                        self.walk_page(ds + 4, de);
+                        self.walk_page(ds + 4, de, 1);
                     }
                     _ => {}
                 }
@@ -330,7 +336,10 @@ impl<'a> StreamParser<'a> {
         }
     }
 
-    fn walk_doc(&mut self, start: usize, end: usize) {
+    fn walk_doc(&mut self, start: usize, end: usize, depth: usize) {
+        if depth >= 64 {
+            return;
+        }
         let mut pos = start;
         while pos.saturating_add(8) <= end {
             let Some(hdr) = self.buf.get(pos..pos + 8) else { break };
@@ -343,9 +352,9 @@ impl<'a> StreamParser<'a> {
             if &cid == b"LIST" {
                 if let Some(lt) = self.buf.get(ds..ds.saturating_add(4)) {
                     if lt == b"bmpt" {
-                        parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps);
+                        parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps, self.max_total, depth + 1);
                     } else if matches!(lt, b"filt" | b"filc" | b"otlt" | b"stlt" | b"bmtb") {
-                        self.walk_doc(ds + 4, de);
+                        self.walk_doc(ds + 4, de, depth + 1);
                     }
                 }
             } else if &cid == b"fild" {
@@ -368,13 +377,19 @@ impl<'a> StreamParser<'a> {
                 && let Some(data) = self.buf.get(ds..de)
                 && let Some((id, bmp)) = parse_bmp_chunk(data)
             {
-                self.bitmaps.insert(id, bmp);
+                let current_total: usize = self.bitmaps.values().map(|b| b.bmp_bytes.len()).sum();
+                if current_total.saturating_add(bmp.bmp_bytes.len()) <= self.max_total {
+                    self.bitmaps.insert(id, bmp);
+                }
             }
             pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
         }
     }
 
-    fn walk_page(&mut self, start: usize, end: usize) {
+    fn walk_page(&mut self, start: usize, end: usize, depth: usize) {
+        if depth >= 64 {
+            return;
+        }
         let mut pos = start;
         while pos.saturating_add(8) <= end {
             let Some(hdr) = self.buf.get(pos..pos + 8) else { break };
@@ -388,8 +403,8 @@ impl<'a> StreamParser<'a> {
                 && let Some(lt) = self.buf.get(ds..ds.saturating_add(4))
             {
                 match lt {
-                    b"gobj" => self.walk_page(ds + 4, de),
-                    b"layr" => self.walk_layer(ds + 4, de),
+                    b"gobj" => self.walk_page(ds + 4, de, depth + 1),
+                    b"layr" => self.walk_layer(ds + 4, de, depth + 1),
                     _ => {}
                 }
             }
@@ -397,7 +412,10 @@ impl<'a> StreamParser<'a> {
         }
     }
 
-    fn walk_layer(&mut self, start: usize, end: usize) {
+    fn walk_layer(&mut self, start: usize, end: usize, depth: usize) {
+        if depth >= 64 {
+            return;
+        }
         // First inspect layer's lgob -> loda to check stype (skip Grid=0x0b and Guides=0x0c) and name.
         let mut layer_stype = 0u32;
         let mut layer_name: Option<String> = None;
@@ -444,7 +462,7 @@ impl<'a> StreamParser<'a> {
         let tentative_layer_idx = existing_idx.unwrap_or(self.layers.len());
         let before_count = self.raw_objects.len();
 
-        self.walk_objects_in_container(start, end, tentative_layer_idx);
+        self.walk_objects_in_container(start, end, tentative_layer_idx, depth + 1);
 
         // CorelDRAW stores objects inside layers/groups in front-to-back order (topmost first,
         // background last); reverse this layer slice so VectorCraft renders back-to-front.
@@ -458,7 +476,10 @@ impl<'a> StreamParser<'a> {
         }
     }
 
-    fn walk_objects_in_container(&mut self, start: usize, end: usize, layer_idx: usize) {
+    fn walk_objects_in_container(&mut self, start: usize, end: usize, layer_idx: usize, depth: usize) {
+        if depth >= 64 {
+            return;
+        }
         let mut pos = start;
         while pos.saturating_add(8) <= end {
             let Some(hdr) = self.buf.get(pos..pos + 8) else { break };
@@ -480,7 +501,7 @@ impl<'a> StreamParser<'a> {
                         }
                     }
                     b"grp " | b"gobj" => {
-                        self.walk_objects_in_container(ds + 4, de, layer_idx);
+                        self.walk_objects_in_container(ds + 4, de, layer_idx, depth + 1);
                     }
                     _ => {}
                 }
@@ -676,11 +697,12 @@ impl<'a> StreamParser<'a> {
     }
 }
 
-fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>) -> ParsedStream {
+fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>, max_total: usize) -> ParsedStream {
     let mut parser = StreamParser {
         buf: stream,
         block_sizes,
         bitmaps,
+        max_total,
         fills: HashMap::new(),
         outlines: HashMap::new(),
         mcfg_size: None,
@@ -806,11 +828,22 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u3
     ParsedStream { width: page_w, height: page_h, artboards, layers: parser.layers, objects }
 }
 
-fn parse_bmpt_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>) {
-    parse_bmpt_range(stream, block_sizes, 12, stream.len(), bitmaps);
+fn parse_bmpt_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>, max_total: usize) {
+    parse_bmpt_range(stream, block_sizes, 12, stream.len(), bitmaps, max_total, 0);
 }
 
-fn parse_bmpt_range(buf: &[u8], block_sizes: &[u32], start: usize, end: usize, bitmaps: &mut HashMap<u32, CdrBitmap>) {
+fn parse_bmpt_range(
+    buf: &[u8],
+    block_sizes: &[u32],
+    start: usize,
+    end: usize,
+    bitmaps: &mut HashMap<u32, CdrBitmap>,
+    max_total: usize,
+    depth: usize,
+) {
+    if depth >= 64 {
+        return;
+    }
     let mut pos = start;
     while pos.saturating_add(8) <= end {
         let Some(hdr) = buf.get(pos..pos + 8) else { break };
@@ -829,9 +862,12 @@ fn parse_bmpt_range(buf: &[u8], block_sizes: &[u32], start: usize, end: usize, b
             && let Some(bdata) = buf.get(ds..de)
             && let Some((id, bmp)) = parse_bmp_chunk(bdata)
         {
-            bitmaps.insert(id, bmp);
+            let current_total: usize = bitmaps.values().map(|b| b.bmp_bytes.len()).sum();
+            if current_total.saturating_add(bmp.bmp_bytes.len()) <= max_total {
+                bitmaps.insert(id, bmp);
+            }
         } else if &cid == b"LIST" {
-            parse_bmpt_range(buf, block_sizes, ds + 4, de, bitmaps);
+            parse_bmpt_range(buf, block_sizes, ds + 4, de, bitmaps, max_total, depth + 1);
         }
         pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
     }
@@ -1243,10 +1279,11 @@ fn parse_outl(outl: &[u8]) -> Option<(u32, Option<CdrStroke>)> {
 /// Extract clean ASCII layer name from a `layr` `loda` chunk.
 fn extract_ascii_string(loda: &[u8]) -> Option<String> {
     let body = loda.get(24..)?;
-    for (idx, window) in body.windows(2).enumerate() {
-        if window[0].is_ascii_alphabetic() && (window[1].is_ascii_alphanumeric() || window[1] == b' ') {
+    let mut idx = 0;
+    while idx + 1 < body.len() {
+        if body[idx].is_ascii_alphabetic() && (body[idx + 1].is_ascii_alphanumeric() || body[idx + 1] == b' ') {
             let mut end = idx;
-            while end < body.len() && body[end] != 0 && (body[end].is_ascii_graphic() || body[end] == b' ') {
+            while end < body.len() && end - idx < 128 && body[end] != 0 && (body[end].is_ascii_graphic() || body[end] == b' ') {
                 end += 1;
             }
             if end > idx + 2
@@ -1261,6 +1298,9 @@ fn extract_ascii_string(loda: &[u8]) -> Option<String> {
                     return Some(clean);
                 }
             }
+            idx = end.max(idx + 1);
+        } else {
+            idx += 1;
         }
     }
     None

@@ -51,6 +51,8 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
                 (0..total_pages).collect()
             };
 
+            let x_shift = page_indices.first().and_then(|&orig_idx| d.artboards.get(orig_idx)).map(|ab| ab.x).unwrap_or(0.0);
+
             // Populate multi-page artboards if present
             if !d.artboards.is_empty() {
                 doc.artboards = page_indices
@@ -60,7 +62,7 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
                         d.artboards.get(orig_idx).map(|ab| Artboard {
                             id: (new_idx as u32) + 1,
                             name: ab.name.clone(),
-                            rect: Rect::new(ab.x, ab.y, ab.x + ab.width, ab.y + ab.height),
+                            rect: Rect::new(ab.x - x_shift, ab.y, ab.x - x_shift + ab.width, ab.y + ab.height),
                             locked: false,
                             show_center_mark: false,
                             show_cross_hairs: false,
@@ -101,10 +103,21 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
 
             let aligned_text = compute_aligned_text(&d);
 
+            let mut used_preview = false;
             if !d.objects.is_empty() {
-                insert_cdr_objects(&mut doc, &d, &layer_ids, default_layer, &decoded_bitmaps, &aligned_text, opts.text_as);
+                let ctx = InsertContext {
+                    layer_ids: &layer_ids,
+                    default_layer,
+                    decoded_bitmaps: &decoded_bitmaps,
+                    aligned_text: &aligned_text,
+                    text_as: opts.text_as,
+                    page_indices: &page_indices,
+                    x_shift,
+                };
+                insert_cdr_objects(&mut doc, &d, &ctx);
             } else if let Some(r) = vectorcraft_cdr::preview(bytes).ok().and_then(|p| raster_image(&p.data).ok()) {
                 // Fallback to preview only if no vector objects exist
+                used_preview = true;
                 let id = doc.alloc_id();
                 let sx = d.width / (r.width as f64).max(1.0);
                 let sy = d.height / (r.height as f64).max(1.0);
@@ -128,7 +141,7 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
 
             apply_crop_options(&mut doc, opts.crop);
 
-            Ok(Imported { doc, warnings, preview_only: false })
+            Ok(Imported { doc, warnings, preview_only: used_preview })
         }
         Err(native) => {
             let (doc, w) = preview(name, bytes, &native)?;
@@ -208,24 +221,29 @@ fn compute_aligned_text(d: &vectorcraft_cdr::Document) -> HashMap<usize, Aligned
     aligned_text
 }
 
-/// Insert native vector, text, and bitmap objects into the document.
-fn insert_cdr_objects(
-    doc: &mut Document,
-    d: &vectorcraft_cdr::Document,
-    layer_ids: &[NodeId],
+struct InsertContext<'a> {
+    layer_ids: &'a [NodeId],
     default_layer: Option<NodeId>,
-    decoded_bitmaps: &HashMap<u32, (String, u32, u32)>,
-    aligned_text: &HashMap<usize, AlignedText>,
+    decoded_bitmaps: &'a HashMap<u32, (String, u32, u32)>,
+    aligned_text: &'a HashMap<usize, AlignedText>,
     text_as: TextAs,
-) {
+    page_indices: &'a [usize],
+    x_shift: f64,
+}
+
+/// Insert native vector, text, and bitmap objects into the document.
+fn insert_cdr_objects(doc: &mut Document, d: &vectorcraft_cdr::Document, ctx: &InsertContext<'_>) {
     for (obj_idx, obj) in d.objects.iter().enumerate() {
-        let target_layer = layer_ids.get(obj.layer_index).copied().or(default_layer);
+        if !ctx.page_indices.contains(&obj.page_index) {
+            continue;
+        }
+        let target_layer = ctx.layer_ids.get(obj.layer_index).copied().or(ctx.default_layer);
         let id = doc.alloc_id();
         if let Some(bmp_id) = obj.bitmap_id {
-            if let Some((key, px_w, px_h)) = decoded_bitmaps.get(&bmp_id) {
+            if let Some((key, px_w, px_h)) = ctx.decoded_bitmaps.get(&bmp_id) {
                 let sx = obj.width.max(1.0) / (*px_w as f64).max(1.0);
                 let sy = obj.height.max(1.0) / (*px_h as f64).max(1.0);
-                let xf = Affine::translate((obj.x, obj.y)) * Affine::scale_non_uniform(sx, sy);
+                let xf = Affine::translate((obj.x - ctx.x_shift, obj.y)) * Affine::scale_non_uniform(sx, sy);
                 let mut n = Node::new(
                     id,
                     NodeKind::Image(Box::new(ImageObject {
@@ -242,9 +260,9 @@ fn insert_cdr_objects(
                 let _ = doc.insert(target_layer, usize::MAX, n);
             }
         } else if let Some(text) = &obj.text {
-            insert_text_object(doc, target_layer, obj, text, aligned_text.get(&obj_idx).copied(), text_as);
+            insert_text_object(doc, target_layer, obj, text, ctx.aligned_text.get(&obj_idx).copied(), ctx);
         } else {
-            insert_path_object(doc, target_layer, id, obj);
+            insert_path_object(doc, target_layer, id, obj, ctx.x_shift);
         }
     }
 }
@@ -255,23 +273,24 @@ fn insert_text_object(
     obj: &vectorcraft_cdr::CdrObject,
     text: &str,
     aligned: Option<AlignedText>,
-    text_as: TextAs,
+    ctx: &InsertContext<'_>,
 ) {
     let id = doc.alloc_id();
     let fill_color = obj.fill.map(|c| Color::Rgb { r: c.r, g: c.g, b: c.b }).unwrap_or(Color::Rgb { r: 0.0, g: 0.0, b: 0.0 });
     let (font_size, baseline) =
         if let Some(aligned) = aligned { (aligned.font_size, aligned.baseline) } else { (obj.font_size, obj.y + obj.font_size) };
     let style = CharStyle { size: font_size, fill: Paint::solid(fill_color), ..Default::default() };
+    let obj_x = obj.x - ctx.x_shift;
     let to = if obj.is_area_text {
-        let mut area_to = TextObject::point(Point::new(obj.x, obj.y), text, style);
+        let mut area_to = TextObject::point(Point::new(obj_x, obj.y), text, style);
         area_to.kind = TextKind::Area { frame: vectorcraft_geom::shapes::rectangle(Rect::new(0.0, 0.0, obj.width.max(10.0), obj.height.max(10.0))) };
         area_to.area.fit = AreaFit::ShrinkText { min_percent: 30.0 };
         area_to
     } else {
-        TextObject::point(Point::new(obj.x, baseline), text, style)
+        TextObject::point(Point::new(obj_x, baseline), text, style)
     };
 
-    if text_as == TextAs::Outlines {
+    if ctx.text_as == TextAs::Outlines {
         let lay = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &to);
         let mut children = Vec::new();
         for g in &lay.glyphs {
@@ -295,22 +314,22 @@ fn insert_text_object(
     }
 }
 
-fn insert_path_object(doc: &mut Document, target_layer: Option<NodeId>, id: NodeId, obj: &vectorcraft_cdr::CdrObject) {
+fn insert_path_object(doc: &mut Document, target_layer: Option<NodeId>, id: NodeId, obj: &vectorcraft_cdr::CdrObject, x_shift: f64) {
     let pd = if !obj.path.is_empty() {
         let mut bp = BezPath::new();
         for &cmd in &obj.path {
             match cmd {
-                PathCmd::MoveTo(x, y) => bp.move_to(Point::new(x, y)),
-                PathCmd::LineTo(x, y) => bp.line_to(Point::new(x, y)),
+                PathCmd::MoveTo(x, y) => bp.move_to(Point::new(x - x_shift, y)),
+                PathCmd::LineTo(x, y) => bp.line_to(Point::new(x - x_shift, y)),
                 PathCmd::CubicTo(x1, y1, x2, y2, x3, y3) => {
-                    bp.curve_to(Point::new(x1, y1), Point::new(x2, y2), Point::new(x3, y3));
+                    bp.curve_to(Point::new(x1 - x_shift, y1), Point::new(x2 - x_shift, y2), Point::new(x3 - x_shift, y3));
                 }
                 PathCmd::ClosePath => bp.close_path(),
             }
         }
         PathData::from_bezpath(&bp)
     } else {
-        let rect = Rect::new(obj.x, obj.y, obj.x + obj.width, obj.y + obj.height);
+        let rect = Rect::new(obj.x - x_shift, obj.y, obj.x - x_shift + obj.width, obj.y + obj.height);
         vectorcraft_geom::shapes::rectangle(rect)
     };
 
