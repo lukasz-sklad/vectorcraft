@@ -115,30 +115,37 @@ pub(super) fn import(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Imp
                     x_shift,
                 };
                 insert_cdr_objects(&mut doc, &d, &ctx);
-            } else if let Some(r) =
-                vectorcraft_cdr::preview(bytes).ok().filter(|p| check_preview_limits(&p.data).is_ok()).and_then(|p| raster_image(&p.data).ok())
-            {
-                // Fallback to preview only if no vector objects exist
-                used_preview = true;
-                let id = doc.alloc_id();
-                let sx = d.width / (r.width as f64).max(1.0);
-                let sy = d.height / (r.height as f64).max(1.0);
-                let xf = Affine::scale_non_uniform(sx, sy);
-                let mut n = Node::new(
-                    id,
-                    NodeKind::Image(Box::new(ImageObject {
-                        key: r.key.clone(),
-                        width: r.width,
-                        height: r.height,
-                        xf,
-                        link: None,
-                        placement: Default::default(),
-                        pixels: None,
-                    })),
-                );
-                n.name = Some(format!("{name} (rendered)"));
-                doc.images.insert(r.key, r.blob);
-                let _ = doc.insert(default_layer, 0, n);
+            } else if let Ok(p) = vectorcraft_cdr::preview(bytes) {
+                if check_preview_limits(&p.data).is_ok()
+                    && let Ok(r) = raster_image(&p.data)
+                {
+                    // Fallback to preview only if no vector objects exist
+                    used_preview = true;
+                    let id = doc.alloc_id();
+                    let sx = d.width / (r.width as f64).max(1.0);
+                    let sy = d.height / (r.height as f64).max(1.0);
+                    let xf = Affine::scale_non_uniform(sx, sy);
+                    let mut n = Node::new(
+                        id,
+                        NodeKind::Image(Box::new(ImageObject {
+                            key: r.key.clone(),
+                            width: r.width,
+                            height: r.height,
+                            xf,
+                            link: None,
+                            placement: Default::default(),
+                            pixels: None,
+                        })),
+                    );
+                    n.name = Some(format!("{name} (rendered)"));
+                    doc.images.insert(r.key, r.blob);
+                    let _ = doc.insert(default_layer, 0, n);
+                } else {
+                    warnings.push("embedded preview exceeds limits or failed to decode".into());
+                    if d.warnings.iter().any(|w| w == "vector stream was uncompressed or could not be decompressed") {
+                        return Err(err(format!("{name}: no importable vector data or usable preview")));
+                    }
+                }
             } else if d.warnings.iter().any(|w| w == "vector stream was uncompressed or could not be decompressed") {
                 return Err(err(format!("{name}: no importable vector data or usable preview")));
             }
