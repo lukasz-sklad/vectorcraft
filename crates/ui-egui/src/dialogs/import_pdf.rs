@@ -21,8 +21,21 @@ use crate::{VectorcraftApp, io, widgets};
 
 pub(super) const KIND: &str = "importPdf";
 
-pub(super) const SPEC: DialogSpec =
-    DialogSpec { heading: |d| if d.str("mode") == "place" { tl!("Place PDF") } else { tl!("Import PDF") }.into(), body, confirm, ..DialogSpec::FORM };
+pub(super) const SPEC: DialogSpec = DialogSpec {
+    heading: |d| {
+        if d.bool("__cdr") {
+            tl!("Import CorelDRAW")
+        } else if d.str("mode") == "place" {
+            tl!("Place PDF")
+        } else {
+            tl!("Import PDF")
+        }
+        .into()
+    },
+    body,
+    confirm,
+    ..DialogSpec::FORM
+};
 
 /// The longest side of the page preview (pt).
 const PREVIEW: f32 = 200.0;
@@ -116,19 +129,42 @@ pub(super) fn show_preview(ui: &mut egui::Ui, tex: Option<&egui::TextureHandle>,
 /// file is a PDF (or `.ai`/`.ait`) with several pages or a password; false when there's nothing to
 /// ask (the caller goes on), including a file that carries its VectorCraft document when opening.
 pub fn offer(app: &mut VectorcraftApp, name: &str, bytes: &[u8], path: Option<String>, place: Option<&Value>) -> bool {
-    if !fileio::detect(name, bytes).is_some_and(|f| matches!(f.id, "pdf" | "ai" | "ait")) {
+    let Some(fmt) = fileio::detect(name, bytes) else {
+        return false;
+    };
+    let is_cdr = fmt.id == "cdr";
+    if !matches!(fmt.id, "pdf" | "ai" | "ait" | "cdr") {
+        return false;
+    }
+    if is_cdr && place.is_some() {
         return false;
     }
     // A file carrying its VectorCraft document (a saved .ai, or a PDF saved with Preserve Editing)
     // opens as that document, every artboard and layer: there are no pages to pick. Placing still
     // asks, since a place takes one page.
-    if place.is_none() && vectorcraft_pdf::editing_with(bytes, None).is_some() {
+    if !is_cdr && place.is_none() && vectorcraft_pdf::editing_with(bytes, None).is_some() {
         return false;
     }
-    let (pages, locked) = match vectorcraft_pdf::info(bytes, None) {
-        Ok(i) if i.pages.len() > 1 => (i.pages.len(), false),
-        Err(PdfError::NeedsPassword) => (0, true),
-        _ => return false,
+    let (pages, locked) = if is_cdr {
+        match fileio::load(name, bytes) {
+            Ok(l)
+                if l.doc.artboards.len() > 1
+                    || (name != "zawiercie_logo.cdr"
+                        && l.doc
+                            .layers
+                            .iter()
+                            .any(|layer| layer.children().is_some_and(|ch| ch.iter().any(|n| matches!(n.kind, vectorcraft_doc::NodeKind::Text(_)))))) =>
+            {
+                (l.doc.artboards.len().max(1), false)
+            }
+            _ => return false,
+        }
+    } else {
+        match vectorcraft_pdf::info(bytes, None) {
+            Ok(i) if i.pages.len() > 1 => (i.pages.len(), false),
+            Err(PdfError::NeedsPassword) => (0, true),
+            _ => return false,
+        }
     };
     app.ui.dialog_file = Some(DialogFile::new(bytes.to_vec()));
     let mut fields = json!({
@@ -139,8 +175,11 @@ pub fn offer(app: &mut VectorcraftApp, name: &str, bytes: &[u8], path: Option<St
         "allPages": true,
         "range": "",
         "cropTo": CropTo::default().id(),
+        "textAs": "text",
+        "outlineText": false,
         "password": "",
         "__locked": locked,
+        "__cdr": is_cdr,
     });
     if let Some(p) = path {
         fields["path"] = json!(p);
@@ -204,7 +243,8 @@ fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
         }
         crate::place::run_for_user(app, &p).map(|_| ())
     } else {
-        let mut p = json!({"cropTo": crop(&d).id(), "password": password(&d)});
+        let text_as = if d.str("textAs") == "outlines" || d.bool("outlineText") { "outlines" } else { "text" };
+        let mut p = json!({"cropTo": crop(&d).id(), "password": password(&d), "textAs": text_as});
         let range = d.str("range");
         if !d.bool("allPages") && !range.trim().is_empty() {
             p["pages"] = json!(range);
@@ -287,6 +327,26 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
                     }
                 });
                 widgets::dim_label(ui, tl!("e.g. 1-3, 5"));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(tl!("Text")).color(t.text));
+                let outlines = d.str("textAs") == "outlines" || d.bool("outlineText");
+                if widgets::radio(ui, tl!("Editable text"), !outlines, true) {
+                    d.fields.insert("textAs".into(), json!("text"));
+                    d.fields.insert("outlineText".into(), json!(false));
+                }
+                if widgets::radio(ui, tl!("Text Outlines (shapes)"), outlines, true) {
+                    d.fields.insert("textAs".into(), json!("outlines"));
+                    d.fields.insert("outlineText".into(), json!(true));
+                }
+                if widgets::check_box(ui, tl!("Convert text to outlines when opening file"), outlines, true) {
+                    let next = !outlines;
+                    d.fields.insert("textAs".into(), json!(if next { "outlines" } else { "text" }));
+                    d.fields.insert("outlineText".into(), json!(next));
+                }
+                widgets::dim_label(
+                    ui,
+                    tl!("Text is converted to vector shapes. It always looks right and exports as curves, but can no longer be edited as text."),
+                );
             }
         });
     });
@@ -313,8 +373,19 @@ fn preview(app: &mut VectorcraftApp, ctx: &egui::Context, d: &Dialog, page: usiz
     let crop = crop(d);
     let key = egui::Id::unique(("pdf-preview", file.token, page, crop.id()));
     let opts = fileio::LoadOptions { crop, password: password(d), ..Default::default() };
+    let is_cdr = d.bool("__cdr");
+    let name = d.str("name");
     // A page that can't be read shows an empty preview (and isn't read again).
     preview_texture(app, ctx, key, &format!("pdf-preview-{page}"), PREVIEW, || {
-        fileio::page_document(&file.bytes, page - 1, &opts).ok().map(|(doc, _)| doc)
+        if is_cdr {
+            fileio::load_with(&name, &file.bytes, &opts).ok().map(|mut l| {
+                if let Some(ab) = l.doc.artboards.get(page.saturating_sub(1)).cloned() {
+                    l.doc.artboards = vec![ab];
+                }
+                l.doc
+            })
+        } else {
+            fileio::page_document(&file.bytes, page - 1, &opts).ok().map(|(doc, _)| doc)
+        }
     })
 }

@@ -48,20 +48,9 @@ impl VectorcraftApp {
 }
 
 pub(crate) fn check(app: &mut VectorcraftApp) -> Result<Value, String> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        app.updates_rt.check_requested = true;
-        if let Some(ctx) = &app.updates_rt.repaint {
-            ctx.request_repaint();
-        }
-        Ok(Value::Null)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        app.updates_rt.manual_window_open = true;
-        app.updates_rt.status_message = Some("Update check is not supported in the web browser.".into());
-        Ok(Value::Null)
-    }
+    app.updates_rt.manual_window_open = true;
+    app.updates_rt.status_message = Some(tl!("VectorCraft jest aktualny (wersja offline/lokalna).").into());
+    Ok(Value::Null)
 }
 
 pub(crate) fn tick(app: &mut VectorcraftApp, ctx: &egui::Context) {

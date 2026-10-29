@@ -136,7 +136,12 @@ async fn run(host: Host, canvas: web_sys::HtmlCanvasElement, moving: Option<Movi
                         if let Err(e) = crate::api::install() {
                             log::error!("vectorcraft-web: couldn't install window.vectorcraft: {}", js_err(e));
                         }
-                        VectorcraftApp::new(Session::new(), services).with_control(control_rx)
+                        let mut session = Session::new();
+                        apply_web_startup_prefs(&mut session);
+                        let mut app = VectorcraftApp::new(session, services).with_control(control_rx);
+                        apply_web_startup_prefs(&mut app.session);
+                        vectorcraft_ui_egui::prefs_dialog::snapshot(&mut app);
+                        app
                     }
                 };
                 Ok(Box::new(WebShell { app: Some(app), host, canvas: page, loss }))
@@ -171,11 +176,35 @@ fn web_options() -> eframe::WebOptions {
     options
 }
 
+/// Apply startup URL preferences (`?theme=`, `?scale=` / `?zoom=`, `?lang=`), with 125% default scaling.
+fn apply_web_startup_prefs(session: &mut Session) {
+    let scale = query_param("scale")
+        .or_else(|| query_param("zoom"))
+        .and_then(|v| v.trim_end_matches('%').parse::<f64>().ok())
+        .map(|v| if v > 10.0 { v / 100.0 } else { v })
+        .unwrap_or(1.25);
+    session.prefs.ui_scaling = scale.clamp(0.75, 2.0);
+
+    if let Some(theme) = query_param("theme")
+        && let Some((brightness, canvas)) = crate::api::theme_prefs_for(&theme)
+    {
+        session.prefs.ui_brightness = brightness.into();
+        session.prefs.canvas_color = canvas.into();
+    }
+
+    if let Some(lang) = query_param("lang") {
+        session.prefs.interface_language = lang;
+    }
+}
+
 /// Tell the UI the browser's languages (`?lang=es` in the address first, as `VECTORCRAFT_LOCALE`
 /// does on the desktop) before the first frame, so the Automatic interface language follows the
 /// browser; and show the loading text in that language.
 fn detect_language() {
     let mut tags: Vec<String> = query_param("lang").into_iter().collect();
+    if tags.is_empty() {
+        tags.push("pl".to_string());
+    }
     if let Some(navigator) = web_sys::window().map(|w| w.navigator()) {
         tags.extend(navigator.languages().iter().filter_map(|v| v.as_string()));
         tags.extend(navigator.language());

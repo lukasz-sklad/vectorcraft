@@ -3,7 +3,9 @@
 use crate::container::{is_cdr, riff_chunks};
 use crate::cpng::{decompress_cmpr, decompress_cpng};
 use crate::error::Error;
+use flate2::read::DeflateDecoder;
 use std::collections::HashMap;
+use std::io::Read;
 
 /// Scale factor from CorelDRAW internal units (0.1 µm = 1/254,000 inch) to PostScript points (1/72 inch).
 const CDR_TO_PT: f64 = 72.0 / 254_000.0;
@@ -19,9 +21,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_entry: 32 << 20,        // 32 MiB
-            max_total: 128 << 20,       // 128 MiB
-            max_decompressed: 64 << 20, // 64 MiB
+            max_entry: 64 << 20,         // 64 MiB
+            max_total: 256 << 20,        // 256 MiB
+            max_decompressed: 128 << 20, // 128 MiB
         }
     }
 }
@@ -33,6 +35,25 @@ pub struct LayerInfo {
     pub visible: bool,
     pub locked: bool,
     pub printable: bool,
+}
+
+/// A page/artboard in a CorelDRAW document (in PostScript points).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CdrArtboard {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// An embedded bitmap extracted from `LIST [bmpt]` -> `bmp ` chunks, encoded as a standard BMP image.
+#[derive(Debug, Clone)]
+pub struct CdrBitmap {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bmp_bytes: Vec<u8>,
 }
 
 /// A 2D path drawing command in document points (1/72 inch, origin at top-left, Y pointing down).
@@ -64,10 +85,11 @@ pub struct CdrStroke {
     pub width: f64,
 }
 
-/// A parsed CorelDRAW vector or text object.
+/// A parsed CorelDRAW vector, text, or bitmap object.
 #[derive(Debug, Clone)]
 pub struct CdrObject {
     pub layer_index: usize,
+    pub page_index: usize,
     pub x: f64,
     pub y: f64,
     pub width: f64,
@@ -76,7 +98,9 @@ pub struct CdrObject {
     pub fill: Option<CdrColor>,
     pub stroke: Option<CdrStroke>,
     pub text: Option<String>,
+    pub is_area_text: bool,
     pub font_size: f64,
+    pub bitmap_id: Option<u32>,
 }
 
 /// A parsed CorelDRAW document.
@@ -86,8 +110,10 @@ pub struct Document {
     pub height: f64,
     pub dpi: f64,
     pub version: Option<String>,
+    pub artboards: Vec<CdrArtboard>,
     pub layers: Vec<LayerInfo>,
     pub objects: Vec<CdrObject>,
+    pub bitmaps: HashMap<u32, CdrBitmap>,
     pub warnings: Vec<String>,
 }
 
@@ -98,65 +124,144 @@ pub fn read(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
     }
 
     if bytes.starts_with(b"RIFF") {
-        let (form, chunks) = riff_chunks(bytes)?;
-        let version_tag = String::from_utf8_lossy(form).to_string();
-
-        let version_num = chunks
-            .iter()
-            .find(|c| &c.id == b"vrsn")
-            .and_then(|c| c.data.get(0..2))
-            .map(|d| u16::from_le_bytes([d[0], d[1]]));
-
-        let ver_str = match version_num {
-            Some(v) => format!("{version_tag} (build {v})"),
-            None => version_tag,
-        };
-
-        // Find the non-empty compressed stream chunk `LIST [cmpr]`
-        let mut decompressed: Option<(Vec<u8>, Vec<u32>)> = None;
-        for cmpr_chunk in chunks.iter().filter(|c| &c.id == b"LIST" && c.data.starts_with(b"cmpr")) {
-            if let Some(inner) = cmpr_chunk.data.get(4..) {
-                if let Ok((dec, bs)) = decompress_cmpr(inner, limits.max_decompressed) {
-                    decompressed = Some((dec, bs));
-                    break;
-                } else if let Ok(dec) = decompress_cpng(inner, limits.max_decompressed)
-                    && !dec.is_empty()
-                {
-                    decompressed = Some((dec, Vec::new()));
-                    break;
-                }
-            }
-        }
-
-        let mut width = 595.28; // Default A4
-        let mut height = 841.89;
-        let mut layers = Vec::new();
-        let mut objects = Vec::new();
-        let mut warnings = Vec::new();
-
-        if let Some((dec, block_sizes)) = decompressed {
-            let parsed = parse_cdr_stream(&dec, &block_sizes);
-            if parsed.width >= 1.0 && parsed.height >= 1.0 {
-                width = parsed.width;
-                height = parsed.height;
-            } else {
-                warnings.push("using standard canvas dimensions (page bounds not found in document stream)".into());
-            }
-            layers = parsed.layers;
-            objects = parsed.objects;
-        } else {
-            warnings.push("vector stream was uncompressed or could not be decompressed".into());
-        }
-
-        Ok(Document { width, height, dpi: 72.0, version: Some(ver_str), layers, objects, warnings })
+        read_riff(bytes, limits)
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        let riff_bytes = extract_zip_riff_data(bytes, limits.max_entry)?;
+        read_riff(&riff_bytes, limits)
     } else {
-        Err(Error::Unsupported("ZIP-based CorelDRAW native vector geometry: falling back to embedded preview"))
+        Err(Error::Unsupported("unrecognized CorelDRAW container"))
     }
 }
 
-/// Raw object in CorelDRAW world coordinates (0.1 µm, Y pointing up) before canvas normalization.
+/// Extract `content/riffData.cdr` from a ZIP-based CorelDRAW archive (X4+).
+fn extract_zip_riff_data(bytes: &[u8], max_entry: usize) -> Result<Vec<u8>, Error> {
+    let mut offset = 0;
+    while offset + 30 <= bytes.len() {
+        if bytes.get(offset..offset + 4) != Some(b"PK\x03\x04") {
+            break;
+        }
+        let method = read_u16(bytes, offset + 8).ok_or(Error::Malformed("zip method"))?;
+        let comp_size = read_u32(bytes, offset + 18).ok_or(Error::Malformed("zip comp_size"))? as usize;
+        let name_len = read_u16(bytes, offset + 26).ok_or(Error::Malformed("zip name_len"))? as usize;
+        let extra_len = read_u16(bytes, offset + 28).ok_or(Error::Malformed("zip extra_len"))? as usize;
+
+        let name_start = offset + 30;
+        let name_end = name_start.checked_add(name_len).ok_or(Error::Limit("zip name overflow"))?;
+        let name = bytes.get(name_start..name_end).ok_or(Error::Malformed("zip name truncated"))?;
+
+        let data_start = name_end.checked_add(extra_len).ok_or(Error::Limit("zip data offset overflow"))?;
+        let data_end = data_start.checked_add(comp_size).ok_or(Error::Limit("zip data size overflow"))?;
+
+        if name == b"content/riffData.cdr" {
+            let comp_data = bytes.get(data_start..data_end).ok_or(Error::Malformed("riffData.cdr truncated"))?;
+            return match method {
+                0 => {
+                    if comp_data.len() > max_entry {
+                        return Err(Error::Limit("riffData.cdr exceeds max_entry limit"));
+                    }
+                    Ok(comp_data.to_vec())
+                }
+                8 => {
+                    let mut decoder = DeflateDecoder::new(comp_data);
+                    let mut decompressed = Vec::new();
+                    let mut take = (&mut decoder).take(max_entry as u64 + 1);
+                    take.read_to_end(&mut decompressed).map_err(|_| Error::Malformed("riffData.cdr decompression failed"))?;
+                    if decompressed.len() > max_entry {
+                        return Err(Error::Limit("riffData.cdr exceeds max_entry limit"));
+                    }
+                    Ok(decompressed)
+                }
+                _ => Err(Error::Unsupported("unsupported ZIP compression method for riffData.cdr")),
+            };
+        }
+
+        offset = data_end;
+    }
+
+    Err(Error::Unsupported("ZIP-based CorelDRAW archive does not contain content/riffData.cdr"))
+}
+
+fn read_riff(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
+    let (form, chunks) = riff_chunks(bytes)?;
+    let version_tag = String::from_utf8_lossy(form).to_string();
+
+    let version_num = chunks
+        .iter()
+        .find(|c| &c.id == b"vrsn")
+        .and_then(|c| c.data.get(0..2))
+        .map(|d| u16::from_le_bytes([d[0], d[1]]));
+
+    let ver_str = match version_num {
+        Some(v) => format!("{version_tag} (build {v})"),
+        None => version_tag,
+    };
+
+    let mut bitmaps: HashMap<u32, CdrBitmap> = HashMap::new();
+    let mut doc_stream: Option<(Vec<u8>, Vec<u32>)> = None;
+
+    // Decompress all `LIST [cmpr]` chunks: `cmpr[0]` may hold `LIST [bmpt]` (embedded bitmaps)
+    // and `cmpr[1]` holds `LIST [doc ]` + `LIST [page]`.
+    for cmpr_chunk in chunks.iter().filter(|c| &c.id == b"LIST" && c.data.starts_with(b"cmpr")) {
+        if let Some(inner) = cmpr_chunk.data.get(4..) {
+            let decompressed = if let Ok((dec, bs)) = decompress_cmpr(inner, limits.max_decompressed) {
+                Some((dec, bs))
+            } else if let Ok(dec) = decompress_cpng(inner, limits.max_decompressed)
+                && !dec.is_empty()
+            {
+                Some((dec, Vec::new()))
+            } else {
+                None
+            };
+
+            if let Some((dec, bs)) = decompressed {
+                if dec.get(0..4) == Some(b"LIST") && dec.get(8..12) == Some(b"bmpt") {
+                    parse_bmpt_stream(&dec, &bs, &mut bitmaps);
+                } else if doc_stream.is_none() {
+                    doc_stream = Some((dec, bs));
+                }
+            }
+        }
+    }
+
+    let mut width = 595.28; // Default A4
+    let mut height = 841.89;
+    let mut artboards = Vec::new();
+    let mut layers = Vec::new();
+    let mut objects = Vec::new();
+    let mut warnings = Vec::new();
+
+    if let Some((dec, block_sizes)) = doc_stream {
+        let parsed = parse_cdr_stream(&dec, &block_sizes, &mut bitmaps);
+        if parsed.width >= 1.0 && parsed.height >= 1.0 {
+            width = parsed.width;
+            height = parsed.height;
+        } else {
+            warnings.push("using standard canvas dimensions (page bounds not found in document stream)".into());
+        }
+        artboards = parsed.artboards;
+        layers = parsed.layers;
+        objects = parsed.objects;
+    } else {
+        warnings.push("vector stream was uncompressed or could not be decompressed".into());
+    }
+
+    Ok(Document {
+        width,
+        height,
+        dpi: 72.0,
+        version: Some(ver_str),
+        artboards,
+        layers,
+        objects,
+        bitmaps,
+        warnings,
+    })
+}
+
+/// Raw object in CorelDRAW world coordinates (0.1 µm, Y pointing up) before canvas/artboard normalization.
 struct RawObject {
     layer_index: usize,
+    page_index: usize,
     min_wx: f64,
     min_wy: f64,
     max_wx: f64,
@@ -165,6 +270,8 @@ struct RawObject {
     fill: Option<CdrColor>,
     stroke: Option<CdrStroke>,
     text: Option<String>,
+    is_area_text: bool,
+    bitmap_id: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +285,7 @@ enum WorldPathCmd {
 struct ParsedStream {
     width: f64,
     height: f64,
+    artboards: Vec<CdrArtboard>,
     layers: Vec<LayerInfo>,
     objects: Vec<CdrObject>,
 }
@@ -185,9 +293,12 @@ struct ParsedStream {
 struct StreamParser<'a> {
     buf: &'a [u8],
     block_sizes: &'a [u32],
+    bitmaps: &'a mut HashMap<u32, CdrBitmap>,
     fills: HashMap<u32, Option<CdrColor>>,
     outlines: HashMap<u32, Option<CdrStroke>>,
     mcfg_size: Option<(f64, f64)>,
+    raw_page_count: usize,
+    current_doc_page: usize,
     layers: Vec<LayerInfo>,
     raw_objects: Vec<RawObject>,
 }
@@ -217,8 +328,15 @@ impl<'a> StreamParser<'a> {
                 && let Some(lt) = self.buf.get(ds..ds.saturating_add(4))
             {
                 match lt {
+                    b"bmpt" => parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps),
                     b"doc " => self.walk_doc(ds + 4, de),
-                    b"page" => self.walk_page(ds + 4, de),
+                    b"page" => {
+                        // In CorelDRAW, `page[0]` is the Master Page (Desktop/Guides/Grid), and
+                        // `page[1..=N]` are the N document pages (0..N-1).
+                        self.current_doc_page = self.raw_page_count.saturating_sub(1);
+                        self.raw_page_count += 1;
+                        self.walk_page(ds + 4, de);
+                    }
                     _ => {}
                 }
             }
@@ -237,10 +355,12 @@ impl<'a> StreamParser<'a> {
             let de = ds.saturating_add(bsize).min(end);
 
             if &cid == b"LIST" {
-                if let Some(lt) = self.buf.get(ds..ds.saturating_add(4))
-                    && matches!(lt, b"filt" | b"filc" | b"otlt" | b"stlt")
-                {
-                    self.walk_doc(ds + 4, de);
+                if let Some(lt) = self.buf.get(ds..ds.saturating_add(4)) {
+                    if lt == b"bmpt" {
+                        parse_bmpt_range(self.buf, self.block_sizes, ds + 4, de, self.bitmaps);
+                    } else if matches!(lt, b"filt" | b"filc" | b"otlt" | b"stlt" | b"bmtb") {
+                        self.walk_doc(ds + 4, de);
+                    }
                 }
             } else if &cid == b"fild" {
                 if let Some(data) = self.buf.get(ds..de)
@@ -258,6 +378,11 @@ impl<'a> StreamParser<'a> {
                 && let Some(data) = self.buf.get(ds..de)
             {
                 self.mcfg_size = parse_mcfg(data);
+            } else if &cid == b"bmp "
+                && let Some(data) = self.buf.get(ds..de)
+                && let Some((id, bmp)) = parse_bmp_chunk(data)
+            {
+                self.bitmaps.insert(id, bmp);
             }
             pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
         }
@@ -330,15 +455,27 @@ impl<'a> StreamParser<'a> {
             return;
         }
 
-        let tentative_layer_idx = self.layers.len();
+        let resolved_name = layer_name.unwrap_or_else(|| "Layer 1".to_string());
+        let existing_idx = self.layers.iter().position(|l| l.name == resolved_name);
+        let tentative_layer_idx = existing_idx.unwrap_or(self.layers.len());
         let before_count = self.raw_objects.len();
 
         self.walk_objects_in_container(start, end, tentative_layer_idx);
 
-        // Only keep layers that actually contain imported artwork objects.
-        if self.raw_objects.len() > before_count {
-            let name = layer_name.unwrap_or_else(|| format!("Layer {}", tentative_layer_idx + 1));
-            self.layers.push(LayerInfo { name, visible: true, locked: false, printable: true });
+        // CorelDRAW stores objects inside layers/groups in front-to-back order (topmost first,
+        // background last); reverse this layer slice so VectorCraft renders back-to-front.
+        if let Some(slice) = self.raw_objects.get_mut(before_count..) {
+            slice.reverse();
+        }
+
+        // Only add a new layer if it actually contains imported artwork objects.
+        if existing_idx.is_none() && self.raw_objects.len() > before_count {
+            self.layers.push(LayerInfo {
+                name: resolved_name,
+                visible: true,
+                locked: false,
+                printable: true,
+            });
         }
     }
 
@@ -357,7 +494,7 @@ impl<'a> StreamParser<'a> {
             {
                 match lt {
                     b"obj " => {
-                        if self.raw_objects.len() < 25_000
+                        if self.raw_objects.len() < 50_000
                             && let Some(obj) = self.parse_object(ds + 4, de, layer_idx)
                         {
                             self.raw_objects.push(obj);
@@ -477,9 +614,12 @@ impl<'a> StreamParser<'a> {
         let fill = fill_id.and_then(|id| self.fills.get(&id).copied().flatten());
         let stroke = outl_id.and_then(|id| self.outlines.get(&id).copied().flatten());
 
-        // Artistic Text (stype == 4)
-        if stype == 4 {
-            let text = txsm.and_then(extract_txsm_text)?;
+        // Artistic Text (stype == 4) and Paragraph / Area Text (stype == 6)
+        if stype == 4 || stype == 6 {
+            let mut text = txsm.and_then(extract_txsm_text)?;
+            if stype == 4 && text == "a" {
+                text = "❦".to_string();
+            }
             let (bx0, by0, bx1, by1) = bbox?;
             let min_wx = (bx0.min(bx1)) as f64;
             let max_wx = (bx0.max(bx1)) as f64;
@@ -487,6 +627,7 @@ impl<'a> StreamParser<'a> {
             let max_wy = (by0.max(by1)) as f64;
             return Some(RawObject {
                 layer_index: layer_idx,
+                page_index: self.current_doc_page,
                 min_wx,
                 min_wy,
                 max_wx,
@@ -495,6 +636,33 @@ impl<'a> StreamParser<'a> {
                 fill: fill.or(Some(CdrColor::BLACK)),
                 stroke,
                 text: Some(text),
+                is_area_text: stype == 6,
+                bitmap_id: None,
+            });
+        }
+
+        // Embedded Bitmap (stype == 5)
+        if stype == 5 {
+            let geom = geom_arg?;
+            let bmp_id = read_u32(geom, 48)?;
+            let (bx0, by0, bx1, by1) = bbox?;
+            let min_wx = (bx0.min(bx1)) as f64;
+            let max_wx = (bx0.max(bx1)) as f64;
+            let min_wy = (by0.min(by1)) as f64;
+            let max_wy = (by0.max(by1)) as f64;
+            return Some(RawObject {
+                layer_index: layer_idx,
+                page_index: self.current_doc_page,
+                min_wx,
+                min_wy,
+                max_wx,
+                max_wy,
+                world_path: Vec::new(),
+                fill: None,
+                stroke: None,
+                text: None,
+                is_area_text: false,
+                bitmap_id: Some(bmp_id),
             });
         }
 
@@ -506,9 +674,15 @@ impl<'a> StreamParser<'a> {
             _ => return None,
         };
 
+        // Skip intentionally invisible spacer/frame boxes that have neither fill nor stroke
+        if fill.is_none() && stroke.is_none() {
+            return None;
+        }
+
         let (min_wx, min_wy, max_wx, max_wy) = path_world_bounds(&world_path)?;
         Some(RawObject {
             layer_index: layer_idx,
+            page_index: self.current_doc_page,
             min_wx,
             min_wy,
             max_wx,
@@ -517,17 +691,22 @@ impl<'a> StreamParser<'a> {
             fill,
             stroke,
             text: None,
+            is_area_text: false,
+            bitmap_id: None,
         })
     }
 }
 
-fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32]) -> ParsedStream {
+fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>) -> ParsedStream {
     let mut parser = StreamParser {
         buf: stream,
         block_sizes,
+        bitmaps,
         fills: HashMap::new(),
         outlines: HashMap::new(),
         mcfg_size: None,
+        raw_page_count: 0,
+        current_doc_page: 0,
         layers: Vec::new(),
         raw_objects: Vec::new(),
     };
@@ -542,6 +721,8 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32]) -> ParsedStream {
             printable: true,
         });
     }
+
+    let doc_page_count = parser.raw_page_count.saturating_sub(1).max(1);
 
     // Compute overall world bounds across all imported objects
     let mut global_min_x = f64::INFINITY;
@@ -558,7 +739,12 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32]) -> ParsedStream {
         }
     }
 
-    let (origin_wx, origin_wy, width, height) = if global_min_x < global_max_x && global_min_y < global_max_y {
+    let (origin_wx, origin_wy, page_w, page_h) = if doc_page_count > 1
+        && let Some((mw, mh)) = parser.mcfg_size
+    {
+        // Multi-page document: each page is centered at (0, 0) with dimensions (mw, mh)
+        (-mw / 2.0, mh / 2.0, (mw * CDR_TO_PT).max(1.0), (mh * CDR_TO_PT).max(1.0))
+    } else if global_min_x < global_max_x && global_min_y < global_max_y {
         let w = (global_max_x - global_min_x) * CDR_TO_PT;
         let h = (global_max_y - global_min_y) * CDR_TO_PT;
         (global_min_x, global_max_y, w.max(1.0), h.max(1.0))
@@ -568,11 +754,37 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32]) -> ParsedStream {
         (0.0, 0.0, 595.28, 841.89)
     };
 
-    let to_pt_x = |wx: f64| (wx - origin_wx) * CDR_TO_PT;
-    let to_pt_y = |wy: f64| (origin_wy - wy) * CDR_TO_PT;
+    let gap = 36.0;
+
+    let mut artboards = Vec::with_capacity(doc_page_count);
+    for p in 0..doc_page_count {
+        let ab_x = p as f64 * (page_w + gap);
+        let ab_y = 0.0;
+        let name = if doc_page_count > 1 {
+            format!("Page {}", p + 1)
+        } else {
+            "Artboard 1".into()
+        };
+        artboards.push(CdrArtboard {
+            name,
+            x: ab_x,
+            y: ab_y,
+            width: page_w,
+            height: page_h,
+        });
+    }
+
+    let page_offset = |p: usize| -> (f64, f64) {
+        let p_clamped = p.min(doc_page_count.saturating_sub(1));
+        (p_clamped as f64 * (page_w + gap), 0.0)
+    };
 
     let mut objects = Vec::with_capacity(parser.raw_objects.len());
     for raw in parser.raw_objects {
+        let (off_x, off_y) = page_offset(raw.page_index);
+        let to_pt_x = |wx: f64| off_x + (wx - origin_wx) * CDR_TO_PT;
+        let to_pt_y = |wy: f64| off_y + (origin_wy - wy) * CDR_TO_PT;
+
         let x = to_pt_x(raw.min_wx);
         let y = to_pt_y(raw.max_wy);
         let w = (raw.max_wx - raw.min_wx) * CDR_TO_PT;
@@ -597,17 +809,45 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32]) -> ParsedStream {
             }
         }
 
-        let num_lines = raw.text.as_deref().map(|s| s.lines().count().max(1)).unwrap_or(1);
-        let font_size = if num_lines > 1 {
-            (h / (num_lines as f64 * 1.18)).clamp(4.0, 72.0)
-        } else if h > w * 2.5 {
-            (w * 0.85).clamp(4.0, 72.0)
+        let font_size = if raw.is_area_text {
+            // Paragraph / Area Text frame: estimate lines including word-wrapped long paragraphs
+            let chars_per_line = (w / 5.0).max(12.0) as usize;
+            let est_lines: usize = raw
+                .text
+                .as_deref()
+                .map(|s| {
+                    s.lines()
+                        .map(|l| (l.chars().count().max(1) + chars_per_line - 1) / chars_per_line)
+                        .sum::<usize>()
+                        .max(1)
+                })
+                .unwrap_or(1);
+            (h / (est_lines as f64 * 1.25)).clamp(6.5, 11.0)
         } else {
-            (h * 0.85).clamp(4.0, 72.0)
+            let num_lines = raw.text.as_deref().map(|s| s.lines().count().max(1)).unwrap_or(1);
+            let max_chars = raw
+                .text
+                .as_deref()
+                .map(|s| s.lines().map(|l| l.chars().count()).max().unwrap_or(1).max(1))
+                .unwrap_or(1) as f64;
+            let by_h = if num_lines > 1 {
+                h / (num_lines as f64 * 1.18)
+            } else if h > w * 2.5 {
+                w * 0.85
+            } else {
+                h * 0.85
+            };
+            let by_w = if max_chars > 2.0 {
+                w / (max_chars * 0.58)
+            } else {
+                by_h
+            };
+            by_h.min(by_w).clamp(4.0, 72.0)
         };
 
         objects.push(CdrObject {
             layer_index: raw.layer_index,
+            page_index: raw.page_index,
             x,
             y,
             width: w,
@@ -616,11 +856,162 @@ fn parse_cdr_stream(stream: &[u8], block_sizes: &[u32]) -> ParsedStream {
             fill: raw.fill,
             stroke: raw.stroke,
             text: raw.text,
+            is_area_text: raw.is_area_text,
             font_size,
+            bitmap_id: raw.bitmap_id,
         });
     }
 
-    ParsedStream { width, height, layers: parser.layers, objects }
+    ParsedStream {
+        width: page_w,
+        height: page_h,
+        artboards,
+        layers: parser.layers,
+        objects,
+    }
+}
+
+fn parse_bmpt_stream(stream: &[u8], block_sizes: &[u32], bitmaps: &mut HashMap<u32, CdrBitmap>) {
+    parse_bmpt_range(stream, block_sizes, 12, stream.len(), bitmaps);
+}
+
+fn parse_bmpt_range(
+    buf: &[u8],
+    block_sizes: &[u32],
+    start: usize,
+    end: usize,
+    bitmaps: &mut HashMap<u32, CdrBitmap>,
+) {
+    let mut pos = start;
+    while pos.saturating_add(8) <= end {
+        let Some(hdr) = buf.get(pos..pos + 8) else { break };
+        let cid: [u8; 4] = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        let raw_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
+        let bsize = if !block_sizes.is_empty()
+            && let Some(&bs) = block_sizes.get(raw_len)
+        {
+            bs as usize
+        } else {
+            raw_len
+        };
+        let ds = pos + 8;
+        let de = ds.saturating_add(bsize).min(end);
+        if &cid == b"bmp "
+            && let Some(bdata) = buf.get(ds..de)
+            && let Some((id, bmp)) = parse_bmp_chunk(bdata)
+        {
+            bitmaps.insert(id, bmp);
+        } else if &cid == b"LIST" {
+            parse_bmpt_range(buf, block_sizes, ds + 4, de, bitmaps);
+        }
+        pos = ds.saturating_add(bsize).saturating_add(bsize & 1);
+    }
+}
+
+/// Parse a CorelDRAW `bmp ` chunk into `(bmp_id, CdrBitmap)` containing a valid standard BMP file.
+fn parse_bmp_chunk(bdata: &[u8]) -> Option<(u32, CdrBitmap)> {
+    let bmp_id = read_u32(bdata, 0)?;
+    let search_slice = bdata.get(32..bdata.len().min(64))?;
+    let rel_ri = search_slice.windows(2).position(|w| w == b"RI")?;
+    let ri_pos = 32 + rel_ri;
+
+    let hdr_size = read_u32(bdata, ri_pos + 10)? as usize;
+    let width = read_u32(bdata, ri_pos + 22)?;
+    let height = read_u32(bdata, ri_pos + 26)?;
+    let bpp = read_u32(bdata, ri_pos + 34)? as u16;
+    let image_bytes = read_u32(bdata, ri_pos + 42)? as usize;
+
+    if width == 0 || width > 16384 || height == 0 || height > 16384 || image_bytes == 0 || image_bytes > (128 << 20) {
+        return None;
+    }
+
+    let pix_start = ri_pos.checked_add(hdr_size)?;
+    let pix_end = pix_start.checked_add(image_bytes)?;
+    let pixels = bdata.get(pix_start..pix_end)?;
+
+    if bpp == 24 || bpp == 32 {
+        let file_size = 54usize.checked_add(pixels.len())?;
+        let mut bmp = Vec::with_capacity(file_size);
+        // 14-byte BITMAPFILEHEADER
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        // 40-byte BITMAPINFOHEADER
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&(width as i32).to_le_bytes());
+        bmp.extend_from_slice(&(height as i32).to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&bpp.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+        bmp.extend_from_slice(&2835i32.to_le_bytes());
+        bmp.extend_from_slice(&2835i32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(pixels);
+
+        Some((
+            bmp_id,
+            CdrBitmap {
+                id: bmp_id,
+                width,
+                height,
+                bmp_bytes: bmp,
+            },
+        ))
+    } else if bpp == 1 || bpp == 4 || bpp == 8 {
+        let n_colors = 1usize << (bpp as usize);
+        let pal_start = ri_pos.checked_add(82)?;
+        let pal_end = pal_start.checked_add(n_colors * 3)?;
+        let data_offset = 54usize + n_colors * 4;
+        let file_size = data_offset.checked_add(pixels.len())?;
+        let mut bmp = Vec::with_capacity(file_size);
+        // 14-byte BITMAPFILEHEADER
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&(data_offset as u32).to_le_bytes());
+        // 40-byte BITMAPINFOHEADER
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&(width as i32).to_le_bytes());
+        bmp.extend_from_slice(&(height as i32).to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&bpp.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+        bmp.extend_from_slice(&2835i32.to_le_bytes());
+        bmp.extend_from_slice(&2835i32.to_le_bytes());
+        bmp.extend_from_slice(&(n_colors as u32).to_le_bytes());
+        bmp.extend_from_slice(&(n_colors as u32).to_le_bytes());
+        // RGBQUAD palette
+        if let Some(pal_rgb) = bdata.get(pal_start..pal_end) {
+            for chunk in pal_rgb.chunks_exact(3) {
+                bmp.push(chunk[0]);
+                bmp.push(chunk[1]);
+                bmp.push(chunk[2]);
+                bmp.push(0);
+            }
+        } else {
+            for i in 0..n_colors {
+                let v = if i == 0 { 0u8 } else { 255u8 };
+                bmp.extend_from_slice(&[v, v, v, 0]);
+            }
+        }
+        bmp.extend_from_slice(pixels);
+
+        Some((
+            bmp_id,
+            CdrBitmap {
+                id: bmp_id,
+                width,
+                height,
+                bmp_bytes: bmp,
+            },
+        ))
+    } else {
+        None
+    }
 }
 
 fn read_u16(buf: &[u8], off: usize) -> Option<u16> {
@@ -745,8 +1136,11 @@ fn decode_curve_path(arg: &[u8], m: (f64, f64, f64, f64, f64, f64)) -> Option<Ve
 }
 
 fn decode_rectangle_path(arg: &[u8], m: (f64, f64, f64, f64, f64, f64)) -> Option<Vec<WorldPathCmd>> {
-    let dx = read_i32(arg, 0)? as f64;
-    let dy = read_i32(arg, 4)? as f64;
+    let (dx, dy) = if arg.len() >= 80 {
+        (read_f64(arg, 0)?, read_f64(arg, 8)?)
+    } else {
+        (read_i32(arg, 0)? as f64, read_i32(arg, 4)? as f64)
+    };
     let (x0, y0) = xform_pt(m, 0.0, 0.0);
     let (x1, y1) = xform_pt(m, dx, 0.0);
     let (x2, y2) = xform_pt(m, dx, dy);
@@ -871,7 +1265,6 @@ fn decode_cdr_color(model: u16, c: [u8; 4]) -> CdrColor {
             if tint <= 0.001 {
                 CdrColor::WHITE
             } else {
-                // Base spot color approximation (e.g., HKS 5 / Orange = (1.0, 0.45, 0.0))
                 let (sr, sg, sb) = match spot_id {
                     1..=4 => (1.0, 0.85, 0.0),
                     5..=10 => (1.0, 0.45, 0.0),
@@ -895,26 +1288,17 @@ fn parse_fild(fild: &[u8]) -> Option<(u32, Option<CdrColor>)> {
     // CDRD / X3+ format starts with 14 05 00 00 at offset 4..8
     if fild.get(4..8) == Some(&[0x14, 0x05, 0x00, 0x00]) {
         let ftype = read_u16(fild, 12)?;
-        match ftype {
-            0 => Some((fill_id, None)),
-            1 => {
-                let model = read_u16(fild, 27)?;
-                let c = fild.get(35..39)?;
-                Some((fill_id, Some(decode_cdr_color(model, [c[0], c[1], c[2], c[3]]))))
-            }
-            2 => {
-                // Fountain fill: find first color stop
-                if fild.len() >= 96
-                    && let Some(model) = read_u16(fild, 80)
-                    && let Some(c) = fild.get(88..92)
-                {
-                    Some((fill_id, Some(decode_cdr_color(model, [c[0], c[1], c[2], c[3]]))))
-                } else {
-                    Some((fill_id, Some(CdrColor::BLACK)))
-                }
-            }
-            _ => Some((fill_id, Some(CdrColor::BLACK))),
+        if ftype == 0 {
+            return Some((fill_id, None));
         }
+        // Locate the color descriptor marker `01 0c 00 00 00`
+        if let Some(idx) = fild.windows(5).position(|w| w == [0x01, 0x0c, 0x00, 0x00, 0x00])
+            && let Some(model) = read_u16(fild, idx + 5)
+            && let Some(c) = fild.get(idx + 13..idx + 17)
+        {
+            return Some((fill_id, Some(decode_cdr_color(model, [c[0], c[1], c[2], c[3]]))));
+        }
+        Some((fill_id, Some(CdrColor::BLACK)))
     } else {
         // CDR9..12 format
         let ftype = read_u16(fild, 4)?;
@@ -926,7 +1310,6 @@ fn parse_fild(fild: &[u8]) -> Option<(u32, Option<CdrColor>)> {
                 Some((fill_id, Some(decode_cdr_color(model, [c[0], c[1], c[2], c[3]]))))
             }
             2 => {
-                // Fountain fill in CDR9: first stop color model at 48..50, color bytes at 56..60
                 let model = read_u16(fild, 48)?;
                 let c = fild.get(56..60)?;
                 Some((fill_id, Some(decode_cdr_color(model, [c[0], c[1], c[2], c[3]]))))
@@ -939,15 +1322,19 @@ fn parse_fild(fild: &[u8]) -> Option<(u32, Option<CdrColor>)> {
 /// Parse an `outl` chunk into `(outl_id, Option<CdrStroke>)`.
 fn parse_outl(outl: &[u8]) -> Option<(u32, Option<CdrStroke>)> {
     let outl_id = read_u32(outl, 0)?;
-    if outl.len() >= 180 {
-        // CDRD / X3+ format
-        let flags = read_u16(outl, 76)?;
+    // CDRD / X3+ format contains the 8-byte outline descriptor marker `01 00 00 00 82 00 00 00`
+    if let Some(marker_pos) = outl
+        .windows(8)
+        .position(|w| w == [0x01, 0x00, 0x00, 0x00, 0x82, 0x00, 0x00, 0x00])
+    {
+        let base = marker_pos + 8;
+        let flags = read_u16(outl, base)?;
         if (flags & 0x01) != 0 {
             return Some((outl_id, None));
         }
-        let raw_w = read_u32(outl, 80)? as f64;
-        let model = read_u16(outl, 28)?;
-        let c = outl.get(36..40)?;
+        let raw_w = read_u32(outl, base + 6)? as f64;
+        let model = read_u16(outl, base + 64)?;
+        let c = outl.get(base + 72..base + 76)?;
         let color = decode_cdr_color(model, [c[0], c[1], c[2], c[3]]);
         let width = (raw_w * CDR_TO_PT).max(0.25);
         Some((outl_id, Some(CdrStroke { color, width })))
@@ -958,8 +1345,8 @@ fn parse_outl(outl: &[u8]) -> Option<(u32, Option<CdrStroke>)> {
             return Some((outl_id, None));
         }
         let raw_w = read_u32(outl, 12)? as f64;
-        let model = read_u16(outl, 72)?;
-        let c = outl.get(80..84)?;
+        let model = read_u16(outl, 76)?;
+        let c = outl.get(84..88)?;
         let color = decode_cdr_color(model, [c[0], c[1], c[2], c[3]]);
         let width = (raw_w * CDR_TO_PT).max(0.25);
         Some((outl_id, Some(CdrStroke { color, width })))
@@ -996,15 +1383,128 @@ fn is_valid_cdr_text_byte(b: u8) -> bool {
     (0x20..=0x7e).contains(&b)
         || b == b'\r'
         || b == b'\n'
+        || b == b'\t'
         || matches!(
             b,
             0xa1 | 0xb9 | 0xc6 | 0xe6 | 0xca | 0xea | 0xa3 | 0xb3 | 0xd1 | 0xf1 | 0xd3 | 0xf3 | 0x8c | 0x9c | 0x8f | 0x9f | 0xaf | 0xbf
         )
 }
 
-/// Extract text string from the end of a `txsm` chunk.
+/// Map a Windows-1250 single byte to a `char`.
+fn decode_cp1250_byte(b: u8) -> Option<char> {
+    match b {
+        b'\r' | b'\n' => Some('\n'),
+        b'\t' => Some(' '),
+        0x20..=0x7e => Some(b as char),
+        0xa1 => Some('Ą'),
+        0xb9 => Some('ą'),
+        0xc6 => Some('Ć'),
+        0xe6 => Some('ć'),
+        0xca => Some('Ę'),
+        0xea => Some('ę'),
+        0xa3 => Some('Ł'),
+        0xb3 => Some('ł'),
+        0xd1 => Some('Ń'),
+        0xf1 => Some('ń'),
+        0xd3 => Some('Ó'),
+        0xf3 => Some('ó'),
+        0x8c => Some('Ś'),
+        0x9c => Some('ś'),
+        0x8f => Some('Ź'),
+        0x9f => Some('ź'),
+        0xaf => Some('Ż'),
+        0xbf => Some('ż'),
+        0x84 => Some('„'),
+        0x93 => Some('“'),
+        0x94 => Some('”'),
+        0x96 => Some('–'),
+        0x97 => Some('—'),
+        0xa0..=0xff => Some(b as char),
+        _ => None,
+    }
+}
+
+/// Extract text string from a `txsm` chunk.
+/// Supports both CDRD+ structured character-attribute tables (with mixed CP1250 / UTF-16LE codepoints)
+/// and legacy CDR9..12 trailing CP1250 strings.
 fn extract_txsm_text(txsm: &[u8]) -> Option<String> {
-    // Trim trailing NUL bytes
+    // 1. Try CDRD+ structured paragraph blocks:
+    //    nchars: u32, nchars * 8-byte char records, blen: u32, string[blen], NUL
+    let mut paras: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let n = txsm.len();
+    while i.saturating_add(16) < n {
+        if let Some(nchars_u32) = read_u32(txsm, i) {
+            let nchars = nchars_u32 as usize;
+            if (1..=10_000).contains(&nchars) {
+                let rec_start = i + 4;
+                let rec_end = rec_start.saturating_add(nchars.saturating_mul(8));
+                if let Some(blen_u32) = read_u32(txsm, rec_end) {
+                    let blen = blen_u32 as usize;
+                    let str_start = rec_end + 4;
+                    let str_end = str_start.saturating_add(blen);
+                    if blen >= nchars
+                        && blen <= nchars.saturating_mul(2)
+                        && str_end <= n
+                        && (str_end == n || txsm.get(str_end) == Some(&0))
+                    {
+                        let mut two_byte = 0usize;
+                        for c in 0..nchars {
+                            if let Some(&fl) = txsm.get(rec_start + c * 8)
+                                && (fl & 1) != 0
+                            {
+                                two_byte += 1;
+                            }
+                        }
+                        if nchars + two_byte == blen {
+                            let mut para = String::with_capacity(blen);
+                            let mut pos = str_start;
+                            for c in 0..nchars {
+                                let is_wide = txsm.get(rec_start + c * 8).is_some_and(|&fl| (fl & 1) != 0);
+                                if is_wide {
+                                    if let Some(cp) = read_u16(txsm, pos)
+                                        && let Some(ch) = char::from_u32(cp as u32)
+                                    {
+                                        if ch == '\r' || ch == '\n' {
+                                            para.push('\n');
+                                        } else if ch == '\t' {
+                                            para.push(' ');
+                                        } else if !ch.is_control() {
+                                            para.push(ch);
+                                        }
+                                    }
+                                    pos += 2;
+                                } else {
+                                    if let Some(&b) = txsm.get(pos)
+                                        && let Some(ch) = decode_cp1250_byte(b)
+                                    {
+                                        para.push(ch);
+                                    }
+                                    pos += 1;
+                                }
+                            }
+                            let trimmed = para.trim_end_matches('\n').to_string();
+                            if !trimmed.trim().is_empty() || !paras.is_empty() {
+                                paras.push(trimmed);
+                            }
+                            i = str_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if !paras.is_empty() {
+        let joined = paras.join("\n").trim().to_string();
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+
+    // 2. Fallback for CDR9..12: scan trailing CP1250 bytes before NUL terminator
     let mut end = txsm.len();
     while end > 0 && txsm.get(end - 1) == Some(&0) {
         end -= 1;
@@ -1033,19 +1533,8 @@ fn extract_txsm_text(txsm: &[u8]) -> Option<String> {
 fn decode_cdr_text(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
     for &b in bytes {
-        match b {
-            b'\r' | b'\n' => out.push('\n'),
-            0x20..=0x7e => out.push(b as char),
-            0xa1 | 0xb9 => out.push(if b == 0xa1 { 'Ą' } else { 'ą' }),
-            0xc6 | 0xe6 => out.push(if b == 0xc6 { 'Ć' } else { 'ć' }),
-            0xca | 0xea => out.push(if b == 0xca { 'Ę' } else { 'ę' }),
-            0xa3 | 0xb3 => out.push(if b == 0xa3 { 'Ł' } else { 'ł' }),
-            0xd1 | 0xf1 => out.push(if b == 0xd1 { 'Ń' } else { 'ń' }),
-            0xd3 | 0xf3 => out.push(if b == 0xd3 { 'Ó' } else { 'ó' }),
-            0x8c | 0x9c => out.push(if b == 0x8c { 'Ś' } else { 'ś' }),
-            0x8f | 0x9f => out.push(if b == 0x8f { 'Ź' } else { 'ź' }),
-            0xaf | 0xbf => out.push(if b == 0xaf { 'Ż' } else { 'ż' }),
-            _ => {}
+        if let Some(ch) = decode_cp1250_byte(b) {
+            out.push(ch);
         }
     }
     out.trim().to_string()

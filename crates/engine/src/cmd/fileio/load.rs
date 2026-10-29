@@ -309,7 +309,7 @@ pub fn load_with(name: &str, bytes: &[u8], opts: &LoadOptions) -> Result<Loaded>
             (i.doc, i.warnings, false)
         }
         "cdr" => {
-            let i = super::cdr::import(&title, bytes)?;
+            let i = super::cdr::import(&title, bytes, opts)?;
             preview_only = i.preview_only;
             (i.doc, i.warnings, false)
         }

@@ -5466,3 +5466,8 @@ axis	Y Axis	Oś Y
 @msg	a {width}×{height} screenshot's byte count overflows	liczba bajtów zrzutu ekranu {width}×{height} przekracza limit
 @msg	the window's {what} ({points} points × {scale} DPI) cannot size a screenshot	{what} okna ({points} punktów × {scale} DPI) nie pozwala ustalić rozmiaru zrzutu ekranu
 	Live preview	Podgląd na żywo
+	Import CorelDRAW	Importuj CorelDRAW
+	Editable text	Edytowalny tekst
+	Text Outlines (shapes)	Tekst Outlines (shapes)
+	Convert text to outlines when opening file	Otwieraj tekst jako krzywe (Outlines) podczas otwierania pliku
+	Text is converted to vector shapes. It always looks right and exports as curves, but can no longer be edited as text.	Tekst zamieniany jest na kształty wektorowe. Zawsze wygląda poprawnie i jest eksportowany jako krzywe, ale nie można go już edytować jako tekstu.

@@ -117,7 +117,26 @@ fn set_fn(obj: &js_sys::Object, name: &str, f: JsValue) -> Result<(), JsValue> {
     js_sys::Reflect::set(obj, &name.into(), &f).map(|_| ())
 }
 
-/// Install `window.vectorcraft`.
+/// Map portal theme name (`"sepia"`, `"light"`, `"dark"`) to `(uiBrightness, canvasColor)`.
+pub fn theme_prefs_for(theme: &str) -> Option<(&'static str, &'static str)> {
+    match theme.trim().to_ascii_lowercase().as_str() {
+        "sepia" => Some(("mediumLight", "darkGray")),
+        "light" | "jasny" => Some(("light", "mediumGray")),
+        "dark" | "ciemny" => Some(("dark", "darkGray")),
+        _ => None,
+    }
+}
+
+/// Send a `prefs.set` update through the control channel and wake the UI.
+pub fn send_prefs(values: Value) {
+    let (req, _rx) = ControlRequest::new("engine.execute", json!({"command": "prefs.set", "params": {"values": values}}));
+    let sent = TX.with(|t| t.borrow().as_ref().is_some_and(|tx| tx.send(req).is_ok()));
+    if sent {
+        repaint();
+    }
+}
+
+/// Install `window.vectorcraft` and `postMessage` listener for portal theme/language/scale sync.
 pub fn install() -> Result<(), JsValue> {
     let obj = js_sys::Object::new();
     set_fn(
@@ -180,5 +199,35 @@ pub fn install() -> Result<(), JsValue> {
     )?;
     let w = web_sys::window().ok_or("no window")?;
     js_sys::Reflect::set(&w, &"vectorcraft".into(), &obj)?;
+
+    let on_msg = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+        let Ok(raw_data) = js_sys::Reflect::get(&e, &"data".into()) else { return };
+        let data = from_js(&raw_data);
+        let msg_type = data.get("type").and_then(Value::as_str).unwrap_or("");
+        match msg_type {
+            "set_theme" | "craft-theme" => {
+                if let Some(theme) = data.get("theme").and_then(Value::as_str)
+                    && let Some((b, c)) = theme_prefs_for(theme)
+                {
+                    send_prefs(json!({ "uiBrightness": b, "canvasColor": c }));
+                }
+            }
+            "set_language" | "craft-lang" => {
+                if let Some(lang) = data.get("lang").or_else(|| data.get("language")).and_then(Value::as_str) {
+                    send_prefs(json!({ "interfaceLanguage": lang }));
+                }
+            }
+            "set_scale" | "craft-scale" => {
+                if let Some(raw) = data.get("scale").or_else(|| data.get("zoom")).and_then(Value::as_f64) {
+                    let s = if raw > 10.0 { raw / 100.0 } else { raw };
+                    send_prefs(json!({ "uiScaling": s.clamp(0.75, 2.0) }));
+                }
+            }
+            _ => {}
+        }
+    });
+    let _ = w.add_event_listener_with_callback("message", on_msg.as_ref().unchecked_ref());
+    on_msg.forget();
+
     Ok(())
 }

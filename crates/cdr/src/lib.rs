@@ -13,7 +13,7 @@ pub mod preview;
 
 pub use container::{ContainerType, is_cdr};
 pub use error::Error;
-pub use model::{CdrColor, CdrObject, CdrStroke, Document, LayerInfo, Limits, PathCmd, read};
+pub use model::{CdrArtboard, CdrBitmap, CdrColor, CdrObject, CdrStroke, Document, LayerInfo, Limits, PathCmd, read};
 pub use preview::{Preview, preview};
 
 #[cfg(test)]
@@ -37,6 +37,12 @@ mod tests {
             "/home/deck/Pictures/cdr/czarna folia.cdr",
             "/home/deck/Pictures/cdr/pomaranczowe-napisy.cdr",
             "/home/deck/Pictures/cdr/2010_KAL.cdr",
+            "/home/deck/Pictures/cdr/spiewnik_CMC/ZAPROSZENIE_CMC.cdr",
+            "/home/deck/Pictures/cdr/spiewnik_2010.cdr",
+            "/home/deck/Pictures/cdr/ulotka.cdr",
+            "/home/deck/Pictures/cdr/art_jura.CDR",
+            "/home/deck/Pictures/cdr/sylwester_ognie.cdr",
+            "/home/deck/Pictures/cdr/szlaki.net.pl.cdr",
         ];
         for file in files {
             let path = std::path::Path::new(file);
@@ -49,12 +55,14 @@ mod tests {
                 assert!(d.height > 0.0);
                 assert!(!d.objects.is_empty(), "{file} should have imported objects");
                 eprintln!(
-                    "{file}: {:.1}x{:.1} pt, version: {:?}, layers: {}, objects: {}",
+                    "{file}: {:.1}x{:.1} pt, pages: {}, version: {:?}, layers: {}, objects: {}, bitmaps: {}",
                     d.width,
                     d.height,
+                    d.artboards.len(),
                     d.version,
                     d.layers.len(),
-                    d.objects.len()
+                    d.objects.len(),
+                    d.bitmaps.len()
                 );
             }
         }
